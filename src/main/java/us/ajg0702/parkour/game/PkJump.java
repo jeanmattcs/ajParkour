@@ -1,6 +1,7 @@
 package us.ajg0702.parkour.game;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -14,6 +15,10 @@ import us.ajg0702.parkour.Main;
 import us.ajg0702.parkour.utils.MaterialParser;
 
 public class PkJump {
+
+	private static final AtomicLong GENERATION_IDS = new AtomicLong();
+
+	private final long sequenceId;
 	
 	PkPlayer ply;
 	Manager man;
@@ -30,6 +35,7 @@ public class PkJump {
 	 * @param from The 'from' location of the previous jump
 	 */
 	public PkJump(PkPlayer ply, Location from) {
+		sequenceId = GENERATION_IDS.incrementAndGet();
 		man = ply.man;
 		this.ply = ply;
 		this.main = man.main;
@@ -41,64 +47,36 @@ public class PkJump {
 		
 		List<Location> bks = new ArrayList<>();
 
-		int maxy = 1;
-		
-		Difficulty d = ply.getArea().getDifficulty();
+		Difficulty d = effectiveDifficulty(ply);
 
-		JumpManager jm = JumpManager.getInstance();
-		
-		if(d.equals(Difficulty.BALANCED)) {
-			d = Difficulty.EASY;
-			if(ply.getScore() >= jm.getBalancedStart(Difficulty.MEDIUM)) {
-				d = Difficulty.MEDIUM;
-			}
-			if(ply.getScore() >= jm.getBalancedStart(Difficulty.HARD)) {
-				d = Difficulty.HARD;
-			}
-			if(ply.getScore() >= jm.getBalancedStart(Difficulty.EXPERT)) {
-				d = Difficulty.EXPERT;
-			}
+		long generationId = sequenceId;
+		Location previous = ply.getPreviousMovementOrigin();
+		List<Location> spatialHistory = guardedRecentReferences(ply, from);
+		List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory = ply.getActiveTrajectory();
+		boolean guardEnabled = NayatsuGenerationConfig.antiUTurnGuardEnabled(main);
+		GuardedCandidates guarded = null;
+		int maxGeneratedY = maxGeneratedY(ply);
+		bks = candidateUniverse(w, x, y, z, d, maxGeneratedY);
+		guarded = guardEnabled ?
+				filterGuardedCandidates(bks, previous, from, spatialHistory, activeTrajectory, d) :
+				new GuardedCandidates(bks, bks, 0, false, Collections.emptyList());
+		if(guarded == null || guarded.candidates.isEmpty()) {
+			throw new IllegalStateException("NO_VALID_CANDIDATE: no sequence-safe and UX-guarded candidates survived the finite jumps.yml universe");
 		}
-		
-		int r = random(d.getMin(), d.getMax());
-		
-		//ply.getPlayer().sendMessage(ply.getScore()+":" + d.toString()+" ("+r+")");
-		
-		if(r > 4) {
-			maxy = 0;
+		GuardedCandidates sequenceAndUxGuarded = guarded;
+		guarded = guardEnabled ?
+				filterOneStepViableCandidates(guarded, spatialHistory, activeTrajectory, d) :
+				guarded;
+		if(guarded.candidates.isEmpty()) {
+			throw new IllegalStateException("ONLY_DEAD_END_CANDIDATES: " + sequenceAndUxGuarded.candidates.size() + " guarded candidates had zero legal next continuations");
 		}
-		if(r >= 5) {
-			r = 5;
-			maxy = 0;
-		}
-		
-		if(ply.getJumps().size() >= 2) {
-			int prevy = ply.getJumps().get(ply.jumps.size()-1).getFrom().getBlockY();
-			int prev2y = ply.getJumps().get(ply.jumps.size()-2).getFrom().getBlockY();
-			//ply.ply.sendMessage(prevy+" - "+prev2y+" = "+(prevy - prev2y));
-			if(prevy - prev2y > 0) {
-				maxy = 0;
-			}
-		}
-		
-		
-		bks.add(new Location(w, x+r, y, z));
-		bks.add(new Location(w, x-r, y, z));
-		bks.add(new Location(w, x+r, y+maxy, z));
-		bks.add(new Location(w, x-r, y+maxy, z));
-		bks.add(new Location(w, x+r, y-maxy, z));
-		bks.add(new Location(w, x-r, y-maxy, z));
-		bks.add(new Location(w, x, y+maxy, z+r));
-		bks.add(new Location(w, x, y-maxy, z+r));
-		bks.add(new Location(w, x, y+maxy, z-r));
-		bks.add(new Location(w, x, y-maxy, z-r));
-		bks.add(new Location(w, x, y+maxy, z+r));
-		bks.add(new Location(w, x, y, z+r));
-		bks.add(new Location(w, x, y, z-r));
-		
+		bks = guarded.candidates;
 		HashMap<Object, Double> sc = new HashMap<>();
-		for(Location bk : bks) {
+		for(Location bk : guarded.originalCandidates) {
 			sc.put(bk, (double)getBlockScore(bk, from, ply.getArea(), ply, ply.getPlayer().getLocation().getYaw()));
+		}
+		if(NayatsuGenerationConfig.debugFallbackLogEnabled(main)) {
+			logGenerationDiagnostics(generationId, from, previous, ply.getPlayer().getLocation().getYaw(), spatialHistory, activeTrajectory, guarded, sc);
 		}
 		
 		/*for(Object k : sc.keySet()) {
@@ -122,13 +100,7 @@ public class PkJump {
 		Double last = scs.get(scsk[scsk.length-1]);
 		Object selected;
 		
-		Map<Object, Double> poss = new HashMap<>();
-		for(Object key : scs.keySet()) {
-			Double v = scs.get(key);
-			if(Math.abs(v - last) < 0.0001) {
-				poss.put(key, v);
-			}
-		}
+		Map<Object, Double> poss = selectHighestEligibleScores(scs, bks, last);
 
 		List<Object> posskeys = new ArrayList<>(poss.keySet());
 		
@@ -136,6 +108,9 @@ public class PkJump {
 		
 		int ki = Main.random(0, posskeys.size()-1);
 		selected = posskeys.get(ki);
+		if(NayatsuGenerationConfig.debugFallbackLogEnabled(main)) {
+			Bukkit.getLogger().info("[ajParkour] generation=" + generationId + " SELECTED candidate=" + xyz((Location) selected) + " eligibleCandidates=" + bks.size() + " rejectedCandidates=" + guarded.rejectedCount + " fallbackUsed=" + guarded.fallbackUsed + " score=" + sc.get(selected));
+		}
 		
 		
 		blocks = new ArrayList<>();
@@ -336,7 +311,7 @@ public class PkJump {
 		
 		if(!area.contains(block)) {
 			d = Math.abs(d) * -1;
-			score =- 10;
+			score -= 10;
 		}
 		//Bukkit.broadcastMessage("d obounds: "+d);
 		
@@ -355,6 +330,397 @@ public class PkJump {
 		
 		return score;
 	}
+
+	static JumpShape shapeForDistance(int r) {
+		int maxy = 1;
+		if(r > 4) {
+			maxy = 0;
+		}
+		if(r >= 5) {
+			r = 5;
+			maxy = 0;
+		}
+		return new JumpShape(r, maxy);
+	}
+
+	static Difficulty effectiveDifficulty(PkPlayer ply) {
+		Difficulty d = ply.getArea().getDifficulty();
+		JumpManager jm = JumpManager.getInstance();
+
+		if(d.equals(Difficulty.BALANCED)) {
+			d = Difficulty.EASY;
+			if(ply.getScore() >= jm.getBalancedStart(Difficulty.MEDIUM)) {
+				d = Difficulty.MEDIUM;
+			}
+			if(ply.getScore() >= jm.getBalancedStart(Difficulty.HARD)) {
+				d = Difficulty.HARD;
+			}
+			if(ply.getScore() >= jm.getBalancedStart(Difficulty.EXPERT)) {
+				d = Difficulty.EXPERT;
+			}
+		}
+		return d;
+	}
+
+	static int maxGeneratedY(PkPlayer ply) {
+		if(ply.getJumps().size() >= 2) {
+			int prevy = ply.getJumps().get(ply.jumps.size()-1).getFrom().getBlockY();
+			int prev2y = ply.getJumps().get(ply.jumps.size()-2).getFrom().getBlockY();
+			if(prevy - prev2y > 0) {
+				return 0;
+			}
+		}
+		return 1;
+	}
+
+	static List<Location> candidateUniverse(World w, int x, int y, int z, Difficulty difficulty, int maxGeneratedY) {
+		List<Location> bks = new ArrayList<>();
+		for(int rawDistance = difficulty.getMin(); rawDistance <= difficulty.getMax(); rawDistance++) {
+			JumpShape shape = shapeForDistance(rawDistance);
+			int maxy = Math.min(shape.maxY, maxGeneratedY);
+			for(Location candidate : candidateLocations(w, x, y, z, shape.distance, maxy)) {
+				if(!containsSameBlock(bks, candidate)) {
+					bks.add(candidate);
+				}
+			}
+		}
+		return bks;
+	}
+
+	static List<Location> candidateLocations(World w, int x, int y, int z, int r, int maxy) {
+		List<Location> bks = new ArrayList<>();
+		bks.add(new Location(w, x+r, y, z));
+		bks.add(new Location(w, x-r, y, z));
+		bks.add(new Location(w, x+r, y+maxy, z));
+		bks.add(new Location(w, x-r, y+maxy, z));
+		bks.add(new Location(w, x+r, y-maxy, z));
+		bks.add(new Location(w, x-r, y-maxy, z));
+		bks.add(new Location(w, x, y+maxy, z+r));
+		bks.add(new Location(w, x, y-maxy, z+r));
+		bks.add(new Location(w, x, y+maxy, z-r));
+		bks.add(new Location(w, x, y-maxy, z-r));
+		bks.add(new Location(w, x, y+maxy, z+r));
+		bks.add(new Location(w, x, y, z+r));
+		bks.add(new Location(w, x, y, z-r));
+		return bks;
+	}
+
+	private static boolean containsSameBlock(List<Location> locations, Location candidate) {
+		for(Location location : locations) {
+			if(sameBlock(location, candidate)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static GuardedCandidates filterReverseTurnCandidates(List<Location> candidates, Location previous, Location from) {
+		return filterNayatsuUxGuardCandidates(candidates, previous, from, Collections.emptyList());
+	}
+
+	static GuardedCandidates filterGuardedCandidates(List<Location> candidates, Location previous, Location from, List<Location> spatialHistory, List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory, Difficulty difficulty) {
+		List<CandidateDiagnostic> diagnostics = new ArrayList<>();
+		List<Location> kept = new ArrayList<>();
+		for(Location candidate : candidates) {
+			CandidateDiagnostic diagnostic = evaluateNayatsuUxGuard(candidate, previous, from, spatialHistory);
+			diagnostic.sequenceValidation = PkJumpSequenceIntegrity.validateAppend(activeTrajectory, from, candidate, difficulty);
+			diagnostic.accepted = diagnostic.accepted && diagnostic.sequenceValidation.accepted;
+			if(!diagnostic.sequenceValidation.accepted) {
+				diagnostic.reason = diagnostic.sequenceValidation.reason;
+			}
+			diagnostics.add(diagnostic);
+			if(diagnostic.accepted) {
+				kept.add(candidate);
+			}
+		}
+		return new GuardedCandidates(candidates, kept, candidates.size() - kept.size(), false, diagnostics);
+	}
+
+	static GuardedCandidates filterOneStepViableCandidates(GuardedCandidates guarded, List<Location> spatialHistory, List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory, Difficulty difficulty) {
+		List<Location> kept = new ArrayList<>();
+		for(CandidateDiagnostic diagnostic : guarded.diagnostics) {
+			if(!diagnostic.accepted) {
+				continue;
+			}
+			diagnostic.viableNextCandidates = viableNextCandidateCount(diagnostic.candidate, spatialHistory, activeTrajectory, difficulty);
+			if(diagnostic.viableNextCandidates > 0) {
+				kept.add(diagnostic.candidate);
+			} else {
+				diagnostic.accepted = false;
+				diagnostic.reason = "REJECT_DEAD_END_CANDIDATE";
+			}
+		}
+		return new GuardedCandidates(guarded.originalCandidates, kept, guarded.originalCandidates.size() - kept.size(), false, guarded.diagnostics);
+	}
+
+	static int viableNextCandidateCount(Location candidate, List<Location> spatialHistory, List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory, Difficulty difficulty) {
+		List<PkJumpSequenceIntegrity.TrajectoryPoint> nextTrajectory = trajectoryAfterCurrentCompletion(activeTrajectory, candidate);
+		if(nextTrajectory.isEmpty()) return 0;
+
+		Location previous = nextTrajectory.size() >= 2 ? nextTrajectory.get(nextTrajectory.size() - 2).location : null;
+		int maxGeneratedY = previous != null && candidate.getBlockY() - previous.getBlockY() > 0 ? 0 : 1;
+		List<Location> nextSpatialHistory = spatialHistoryAfterCurrentCompletion(spatialHistory, activeTrajectory);
+		List<Location> nextUniverse = candidateUniverse(candidate.getWorld(), candidate.getBlockX(), candidate.getBlockY(), candidate.getBlockZ(), difficulty, maxGeneratedY);
+		int viable = 0;
+		for(Location nextCandidate : nextUniverse) {
+			CandidateDiagnostic diagnostic = evaluateNayatsuUxGuard(nextCandidate, previous, candidate, nextSpatialHistory);
+			diagnostic.sequenceValidation = PkJumpSequenceIntegrity.validateAppend(nextTrajectory, candidate, nextCandidate, difficulty);
+			if(diagnostic.accepted && diagnostic.sequenceValidation.accepted) {
+				viable++;
+			}
+		}
+		return viable;
+	}
+
+	static List<PkJumpSequenceIntegrity.TrajectoryPoint> trajectoryAfterCurrentCompletion(List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory, Location candidate) {
+		List<PkJumpSequenceIntegrity.TrajectoryPoint> nextTrajectory = new ArrayList<>();
+		List<PkJumpSequenceIntegrity.TrajectoryPoint> source = activeTrajectory == null ? Collections.emptyList() : activeTrajectory;
+		for(int i = source.size() > 1 ? 1 : 0; i < source.size(); i++) {
+			nextTrajectory.add(source.get(i));
+		}
+		nextTrajectory.add(new PkJumpSequenceIntegrity.TrajectoryPoint(-1, "LOOKAHEAD", candidate));
+		return nextTrajectory;
+	}
+
+	static List<Location> spatialHistoryAfterCurrentCompletion(List<Location> spatialHistory, List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory) {
+		List<Location> nextSpatialHistory = new ArrayList<>();
+		if(spatialHistory != null) {
+			nextSpatialHistory.addAll(spatialHistory);
+		}
+		if(activeTrajectory != null && activeTrajectory.size() > 1) {
+			nextSpatialHistory.add(activeTrajectory.get(1).location);
+		}
+		return nextSpatialHistory;
+	}
+
+	static GuardedCandidates filterNayatsuUxGuardCandidates(List<Location> candidates, Location previous, Location from, List<Location> recentReferences) {
+		List<CandidateDiagnostic> diagnostics = new ArrayList<>();
+		List<Location> kept = new ArrayList<>();
+		for(Location candidate : candidates) {
+			CandidateDiagnostic diagnostic = evaluateNayatsuUxGuard(candidate, previous, from, recentReferences);
+			diagnostics.add(diagnostic);
+			if(diagnostic.accepted) {
+				kept.add(candidate);
+			}
+		}
+		return new GuardedCandidates(candidates, kept, candidates.size() - kept.size(), false, diagnostics);
+	}
+
+	static CandidateDiagnostic evaluateNayatsuUxGuard(Location candidate, Location previous, Location from, List<Location> recentReferences) {
+		int prevX = previous == null ? 0 : Integer.compare(from.getBlockX() - previous.getBlockX(), 0);
+		int prevZ = previous == null ? 0 : Integer.compare(from.getBlockZ() - previous.getBlockZ(), 0);
+		int nextX = Integer.compare(candidate.getBlockX() - from.getBlockX(), 0);
+		int nextZ = Integer.compare(candidate.getBlockZ() - from.getBlockZ(), 0);
+		double distanceFromCurrent = horizontalDistance(candidate, from);
+		double nearestRecentDistance = nearestHorizontalDistance(candidate, recentReferences);
+		boolean hasPreviousDirection = previous != null && !(prevX == 0 && prevZ == 0);
+		boolean reverse = hasPreviousDirection && nextX == -prevX && nextZ == -prevZ;
+		boolean recentRegion = nearestRecentDistance <= distanceFromCurrent;
+		boolean accepted = !reverse && !recentRegion;
+		String reason = "PASS";
+		if(reverse) {
+			reason = "REJECT_ANTI_U_TURN";
+		} else if(recentRegion) {
+			reason = "REJECT_RECENT_REGION";
+		}
+		return new CandidateDiagnostic(candidate, distanceFromCurrent, nearestRecentDistance, turnAngle(previous, from, candidate), !reverse, !recentRegion, accepted, reason);
+	}
+
+	static List<Location> guardedRecentReferences(PkPlayer ply, Location from) {
+		List<Location> references = new ArrayList<>();
+		references.addAll(ply.getSpatialHistory());
+		return references;
+	}
+
+	private static double nearestHorizontalDistance(Location candidate, List<Location> references) {
+		double nearest = Double.POSITIVE_INFINITY;
+		for(Location reference : references) {
+			if(reference == null || candidate.getWorld() != null && reference.getWorld() != null && !candidate.getWorld().equals(reference.getWorld())) continue;
+			nearest = Math.min(nearest, horizontalDistance(candidate, reference));
+		}
+		return nearest;
+	}
+
+	private static double horizontalDistance(Location a, Location b) {
+		double dx = a.getBlockX() - b.getBlockX();
+		double dz = a.getBlockZ() - b.getBlockZ();
+		return Math.sqrt(dx * dx + dz * dz);
+	}
+
+	private static double turnAngle(Location previous, Location from, Location candidate) {
+		if(previous == null) return 0;
+		double ax = from.getBlockX() - previous.getBlockX();
+		double az = from.getBlockZ() - previous.getBlockZ();
+		double bx = candidate.getBlockX() - from.getBlockX();
+		double bz = candidate.getBlockZ() - from.getBlockZ();
+		double amag = Math.sqrt(ax * ax + az * az);
+		double bmag = Math.sqrt(bx * bx + bz * bz);
+		if(amag == 0 || bmag == 0) return 0;
+		double dot = ax * bx + az * bz;
+		double cosine = Math.max(-1, Math.min(1, dot / (amag * bmag)));
+		return Math.toDegrees(Math.acos(cosine));
+	}
+
+	private static boolean sameBlock(Location a, Location b) {
+		if(a == null || b == null) return false;
+		if(a.getWorld() != null && b.getWorld() != null && !a.getWorld().equals(b.getWorld())) return false;
+		return
+				a.getBlockX() == b.getBlockX() &&
+				a.getBlockY() == b.getBlockY() &&
+				a.getBlockZ() == b.getBlockZ();
+	}
+
+	static Map<Object, Double> selectHighestEligibleScores(Map<Object, Double> sortedScores, List<Location> eligibleCandidates, Double globalBestScore) {
+		Map<Object, Double> poss = new HashMap<>();
+		for(Object key : sortedScores.keySet()) {
+			if(!eligibleCandidates.contains(key)) continue;
+			Double v = sortedScores.get(key);
+			if(Math.abs(v - globalBestScore) < 0.0001) {
+				poss.put(key, v);
+			}
+		}
+		if(!poss.isEmpty()) {
+			return poss;
+		}
+
+		Double eligibleBest = null;
+		for(Object key : sortedScores.keySet()) {
+			if(!eligibleCandidates.contains(key)) continue;
+			Double v = sortedScores.get(key);
+			if(eligibleBest == null || v > eligibleBest) {
+				eligibleBest = v;
+			}
+		}
+		if(eligibleBest == null) {
+			return poss;
+		}
+		for(Object key : sortedScores.keySet()) {
+			if(!eligibleCandidates.contains(key)) continue;
+			Double v = sortedScores.get(key);
+			if(Math.abs(v - eligibleBest) < 0.0001) {
+				poss.put(key, v);
+			}
+		}
+		return poss;
+	}
+
+	private static void logGenerationDiagnostics(long generationId, Location from, Location previous, float yaw, List<Location> recentReferences, List<PkJumpSequenceIntegrity.TrajectoryPoint> activeTrajectory, GuardedCandidates guarded, Map<Object, Double> scores) {
+		Bukkit.getLogger().info("[ajParkour] generation=" + generationId + " candidateSequence=#" + generationId + " current=" + xyz(from) + " previous=" + xyz(previous) + " movementVector=" + vector(previous, from) + " playerYaw=" + yaw + " spatialHistory=" + xyzList(recentReferences) + " activeTrajectory=" + trajectoryList(activeTrajectory));
+		for(CandidateDiagnostic diagnostic : guarded.diagnostics) {
+			Double score = scores.get(diagnostic.candidate);
+			Bukkit.getLogger().info("[ajParkour] generation=" + generationId +
+					" candidate=" + xyz(diagnostic.candidate) +
+					" distanceFromCurrent=" + diagnostic.distanceFromCurrent +
+					" nearestRecentDistance=" + diagnostic.nearestRecentDistance +
+					" turnAngle=" + diagnostic.turnAngle +
+					" yawDelta=NA" +
+					" antiUTurn=" + passReject(diagnostic.antiUTurnPass) +
+					" recentRegion=" + passReject(diagnostic.recentRegionPass) +
+					" visualSeparation=" + passReject(diagnostic.accepted) +
+					" originalEligibility=PASS" +
+					" final=" + (diagnostic.accepted ? "ACCEPT" : "REJECT") +
+					" reason=" + diagnostic.reason +
+					" score=" + score +
+					" viableNextCandidates=" + diagnostic.viableNextCandidates +
+					" reachability=" + reachabilityList(diagnostic.sequenceValidation));
+		}
+	}
+
+	private static String passReject(boolean pass) {
+		return pass ? "PASS" : "REJECT";
+	}
+
+	private static String xyz(Location location) {
+		if(location == null) return "null";
+		return location.getWorld().getName() + ":" + location.getBlockX() + "," + location.getBlockY() + "," + location.getBlockZ();
+	}
+
+	private static String vector(Location previous, Location current) {
+		if(previous == null || current == null) return "null";
+		return (current.getBlockX() - previous.getBlockX()) + "," + (current.getBlockY() - previous.getBlockY()) + "," + (current.getBlockZ() - previous.getBlockZ());
+	}
+
+	private static String xyzList(List<Location> locations) {
+		List<String> raw = new ArrayList<>();
+		for(Location location : locations) {
+			raw.add(xyz(location));
+		}
+		return raw.toString();
+	}
+
+	private static String trajectoryList(List<PkJumpSequenceIntegrity.TrajectoryPoint> trajectory) {
+		List<String> raw = new ArrayList<>();
+		for(PkJumpSequenceIntegrity.TrajectoryPoint point : trajectory) {
+			raw.add("#" + point.sequenceId + " " + point.role + " " + xyz(point.location));
+		}
+		return raw.toString();
+	}
+
+	private static String reachabilityList(PkJumpSequenceIntegrity.SequenceValidation validation) {
+		if(validation == null) return "[]";
+		List<String> raw = new ArrayList<>();
+		for(PkJumpSequenceIntegrity.ReachabilityEdge edge : validation.edges) {
+			raw.add("#" + edge.from.sequenceId + "->candidate=" + edge.reachable + (edge.label.isEmpty() ? "" : " " + edge.label));
+		}
+		if(validation.source != null) {
+			raw.add("shortcutSource=#" + validation.source.sequenceId);
+		}
+		return raw.toString();
+	}
+
+	static class GuardedCandidates {
+		final List<Location> originalCandidates;
+		final List<Location> candidates;
+		final int rejectedCount;
+		final boolean fallbackUsed;
+		final List<CandidateDiagnostic> diagnostics;
+
+		GuardedCandidates(List<Location> candidates, boolean fallbackUsed) {
+			this(candidates, candidates, 0, fallbackUsed, Collections.emptyList());
+		}
+
+		GuardedCandidates(List<Location> originalCandidates, List<Location> candidates, int rejectedCount, boolean fallbackUsed, List<CandidateDiagnostic> diagnostics) {
+			this.originalCandidates = originalCandidates;
+			this.candidates = candidates;
+			this.rejectedCount = rejectedCount;
+			this.fallbackUsed = fallbackUsed;
+			this.diagnostics = diagnostics;
+		}
+	}
+
+	static class CandidateDiagnostic {
+		final Location candidate;
+		final double distanceFromCurrent;
+		final double nearestRecentDistance;
+		final double turnAngle;
+		final boolean antiUTurnPass;
+		final boolean recentRegionPass;
+		boolean accepted;
+		String reason;
+		PkJumpSequenceIntegrity.SequenceValidation sequenceValidation;
+		int viableNextCandidates = -1;
+
+		CandidateDiagnostic(Location candidate, double distanceFromCurrent, double nearestRecentDistance, double turnAngle, boolean antiUTurnPass, boolean recentRegionPass, boolean accepted, String reason) {
+			this.candidate = candidate;
+			this.distanceFromCurrent = distanceFromCurrent;
+			this.nearestRecentDistance = nearestRecentDistance;
+			this.turnAngle = turnAngle;
+			this.antiUTurnPass = antiUTurnPass;
+			this.recentRegionPass = recentRegionPass;
+			this.accepted = accepted;
+			this.reason = reason;
+		}
+	}
+
+	static class JumpShape {
+		final int distance;
+		final int maxY;
+
+		JumpShape(int distance, int maxY) {
+			this.distance = distance;
+			this.maxY = maxY;
+		}
+	}
 	
 	
 	
@@ -367,6 +733,11 @@ public class PkJump {
 		if(r == null) Bukkit.getLogger().warning("[ajParkour] Warning: getFrom() returned null!");
 		return r;
 	}
+
+	long getSequenceId() {
+		return sequenceId;
+	}
+
 	/**
 	 * Get 'to' location
 	 * @return a {@link org.bukkit.Location Location} that the player is supposed to jump to from the previous jump

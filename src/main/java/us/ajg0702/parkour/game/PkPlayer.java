@@ -22,12 +22,14 @@ import us.ajg0702.parkour.utils.VersionSupport;
 import us.ajg0702.utils.spigot.Config;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 
 public class PkPlayer implements Listener {
-	
+
 	long lastmove;
 	
 	Player ply;
@@ -45,6 +47,10 @@ public class PkPlayer implements Listener {
 	long started;
 	
 	List<PkJump> jumps;
+
+	Deque<Location> recentJumpHistory = new ArrayDeque<>();
+
+	int recentJumpHistoryLimit;
 	
 	int score = 0;
 	
@@ -94,6 +100,7 @@ public class PkPlayer implements Listener {
 		scores = plugin.scores;
 		
 		config = plugin.getAConfig();
+		recentJumpHistoryLimit = NayatsuGenerationConfig.recentHistorySize(plugin);
 		
 		block = plugin.selector.getBlock(p, area);
 		
@@ -223,11 +230,19 @@ public class PkPlayer implements Listener {
 	
 	private void madeIt() {
 		score++;
+		recordRecentJump(recentJumpHistory, jumps.get(1).getTo(), recentJumpHistoryLimit);
 		jumps.get(0).remove();
 		jumps.remove(0);
 		Location prevJump = jumps.get(jumps.size()-1).getFrom();
 		//ply.sendMessage(AreaStorage.coordsString(prevJump));
-		PkJump nj = new PkJump(this, prevJump);
+		PkJump nj;
+		try {
+			nj = new PkJump(this, prevJump);
+		} catch(IllegalStateException e) {
+			Bukkit.getLogger().severe("[ajParkour] Ending parkour because no sequence-safe continuation could be generated: " + e.getMessage());
+			end("Could not generate the next parkour jump safely.");
+			return;
+		}
 		nj.place();
 		jumps.add(nj);
 		VersionSupport.sendActionBar(ply, 
@@ -325,20 +340,22 @@ public class PkPlayer implements Listener {
 	 * @return A boolean telling if they made the jump or not.
 	 */
 	public boolean checkMadeIt() {
-		double x = ply.getLocation().getX();
-		double z = ply.getLocation().getZ();
-		
-		Location goal = jumps.get(1).getTo();
-		double xg = goal.getX()+0.5;
-		double zg = goal.getZ()+0.5;
-		double xdist = Math.abs(x - xg);
-		double ydist = Math.abs(z - zg);
-		//ply.sendMessage("x: "+xdist+"\ny: "+ydist);
-		if(xdist < 0.8 && ydist < 0.8) {
+		if(isInsideMadeItZone(ply.getLocation(), jumps.get(1).getTo())) {
 			madeIt();
 			return true;
 		}
 		return false;
+	}
+
+	static boolean isInsideMadeItZone(Location playerLocation, Location goal) {
+		double x = playerLocation.getX();
+		double z = playerLocation.getZ();
+
+		double xg = goal.getX()+0.5;
+		double zg = goal.getZ()+0.5;
+		double xdist = Math.abs(x - xg);
+		double zdist = Math.abs(z - zg);
+		return xdist < 0.8 && zdist < 0.8;
 	}
 	
 	/**
@@ -348,13 +365,15 @@ public class PkPlayer implements Listener {
 		int below = 1;
 		Location plyloc = ply.getLocation();
 		int my = jumps.get(0).getTo().getBlockY();
-		if(
-				plyloc.getBlockY() < my-below ||
-				ply.isFlying() ||
-				plyloc.getBlockY() > getHighestBlock().getTo().getBlockY()+3
-			) {
+		if(shouldEndForFall(plyloc, ply.isFlying(), my, getHighestBlock().getTo().getBlockY(), below)) {
 			end();
 		}
+	}
+
+	static boolean shouldEndForFall(Location playerLocation, boolean flying, int currentBlockY, int highestBlockY, int below) {
+		return playerLocation.getBlockY() < currentBlockY-below ||
+				flying ||
+				playerLocation.getBlockY() > highestBlockY+3;
 	}
 	
 	/**
@@ -389,6 +408,59 @@ public class PkPlayer implements Listener {
 	public List<PkJump> getJumps() {
 		return jumps;
 	}
+
+	Location getCurrentPlatform() {
+		return jumps.isEmpty() ? null : jumps.get(0).getTo();
+	}
+
+	List<Location> getPendingPlatforms() {
+		List<Location> pending = new ArrayList<>();
+		for(int i = 1; i < jumps.size(); i++) {
+			pending.add(jumps.get(i).getTo());
+		}
+		return pending;
+	}
+
+	List<PkJumpSequenceIntegrity.TrajectoryPoint> getActiveTrajectory() {
+		List<PkJumpSequenceIntegrity.TrajectoryPoint> trajectory = new ArrayList<>();
+		for(int i = 0; i < jumps.size(); i++) {
+			PkJump jump = jumps.get(i);
+			trajectory.add(new PkJumpSequenceIntegrity.TrajectoryPoint(
+					jump.getSequenceId(),
+					i == 0 ? "CURRENT" : "PENDING",
+					jump.getTo()
+			));
+		}
+		return trajectory;
+	}
+
+	Location getImmediatePredecessor() {
+		return jumps.isEmpty() ? null : jumps.get(jumps.size() - 1).getTo();
+	}
+
+	Location getPreviousMovementOrigin() {
+		return jumps.size() >= 2 ? jumps.get(jumps.size() - 2).getTo() : null;
+	}
+
+	List<Location> getSpatialHistory() {
+		return getRecentJumpHistory();
+	}
+
+	List<Location> getRecentJumpHistory() {
+		return new ArrayList<>(recentJumpHistory);
+	}
+
+	static void recordRecentJump(Deque<Location> history, Location consumedJump, int limit) {
+		if(limit <= 0) return;
+		history.addLast(consumedJump.clone());
+		while(history.size() > limit) {
+			history.removeFirst();
+		}
+	}
+
+	static void clearRecentJumpHistory(Deque<Location> history) {
+		history.clear();
+	}
 	
 
 	
@@ -407,6 +479,7 @@ public class PkPlayer implements Listener {
 		for(PkJump j : jumps) {
 			j.remove();
 		}
+		clearRecentJumpHistory(recentJumpHistory);
 		
 		Bukkit.getScheduler().cancelTask(afktask);
 		
